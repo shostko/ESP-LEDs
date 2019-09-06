@@ -18,8 +18,10 @@
       - FastLED 
       - PubSubClient
       - ArduinoJSON
+      - WiFiManager
 */
 
+#include <FS.h> 
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
@@ -27,16 +29,28 @@
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <DNSServer.h>            // Local DNS Server used for redirecting all requests to the configuration portal
+#include <ESP8266WebServer.h>     // Local WebServer used to serve the configuration portal
+#include <WiFiManager.h>          // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+
 
 
 
 /************ WIFI and MQTT Information (CHANGE THESE FOR YOUR SETUP) ******************/
-const char* ssid = "YourSSID"; //type your WIFI information inside the quotes
-const char* password = "YourWIFIpassword";
-const char* mqtt_server = "your.MQTT.server.ip";
-const char* mqtt_username = "yourMQTTusername";
-const char* mqtt_password = "yourMQTTpassword";
-const int mqtt_port = 1883;
+char mqtt_server[40];
+char mqtt_port[6] = "1883";
+char mqtt_username[20];
+char mqtt_password[20];
+char mqtt_topic[40] = "espleds";
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 
 
@@ -48,8 +62,10 @@ int OTAport = 8266;
 
 
 /************* MQTT TOPICS (change these topics as you wish)  **************************/
-const char* light_state_topic = "bruh/porch";
-const char* light_set_topic = "bruh/porch/set";
+const char* light_state = "/state";
+const char* light_set = "/set";
+char topic_state[46];
+char topic_set[44];
 
 const char* on_cmd = "ON";
 const char* off_cmd = "OFF";
@@ -185,7 +201,7 @@ void setup() {
   gPal = HeatColors_p; //for FIRE
 
   setup_wifi();
-  client.setServer(mqtt_server, mqtt_port);
+  client.setServer(mqtt_server, convertPort(mqtt_port));
   client.setCallback(callback);
 
   //OTA SETUP
@@ -221,29 +237,160 @@ void setup() {
 
 }
 
-
+uint16_t convertPort(char* strPort) {
+  uint16_t port = 0;
+  for (byte i = 0; i < sizeof(strPort); i++) {
+    char part = strPort[i];
+    if (part == '0') {
+      port = port * 10;
+    } else if (part == '1') {
+      port = port * 10 + 1;
+    } else if (part == '2') {
+      port = port * 10 + 2;
+    } else if (part == '3') {
+      port = port * 10 + 3;
+    } else if (part == '4') {
+      port = port * 10 + 4;
+    } else if (part == '5') {
+      port = port * 10 + 5;
+    } else if (part == '6') {
+      port = port * 10 + 6;
+    } else if (part == '7') {
+      port = port * 10 + 7;
+    } else if (part == '8') {
+      port = port * 10 + 8;
+    } else if (part == '9') {
+      port = port * 10 + 9;
+    }
+  }
+  return port;
+}
 
 
 /********************************** START SETUP WIFI*****************************************/
 void setup_wifi() {
 
   delay(10);
-  // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  //clean FS, for testing
+  // SPIFFS.format();
+
+  //read configuration from FS json
+  Serial.println("mounting FS...");
+
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          Serial.println("\nparsed json");
+
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+          strcpy(mqtt_username, json["mqtt_username"]);
+          strcpy(mqtt_password, json["mqtt_password"]);
+          strcpy(mqtt_topic, json["mqtt_topic"]);
+
+        } else {
+          Serial.println("failed to load json config");
+        }
+        configFile.close();
+      }
+    }
+  } else {
+    Serial.println("failed to mount FS");
+  }
+  //end read
+
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
+  WiFiManagerParameter custom_mqtt_username("mqtt_username", "mqtt username", mqtt_username, 20);
+  WiFiManagerParameter custom_mqtt_password("mqtt_password", "mqtt password", mqtt_password, 20);
+  WiFiManagerParameter custom_mqtt_topic("mqtt_topic", "mqtt topick", mqtt_topic, 40);
+
+  //WiFiManager
+  //Local intialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  //add all your parameters here
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_username);
+  wifiManager.addParameter(&custom_mqtt_password);
+  wifiManager.addParameter(&custom_mqtt_topic);
+
+  //reset settings - for testing
+  // wifiManager.resetSettings();
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point
+  //and goes into a blocking loop awaiting configuration
+  if (!wifiManager.autoConnect()) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
   }
 
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  //if you get here you have connected to the WiFi
+  Serial.println("connected...yeey :)");
+
+  //read updated parameters
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(mqtt_username, custom_mqtt_username.getValue());
+  strcpy(mqtt_password, custom_mqtt_password.getValue());
+  strcpy(mqtt_topic, custom_mqtt_topic.getValue());
+
+  strcpy(topic_state, mqtt_topic);
+  strcat(topic_state, light_state);
+  strcpy(topic_set, mqtt_topic);
+  strcat(topic_set, light_set);
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+    json["mqtt_username"] = mqtt_username;
+    json["mqtt_password"] = mqtt_password;
+    json["mqtt_topic"] = mqtt_topic;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    Serial.println();
+    //end save
+  }
+
+  Serial.print("local ip: ");
   Serial.println(WiFi.localIP());
 }
 
@@ -434,7 +581,7 @@ void sendState() {
   char buffer[root.measureLength() + 1];
   root.printTo(buffer, sizeof(buffer));
 
-  client.publish(light_state_topic, buffer, true);
+  client.publish(&topic_state[0], buffer, true);
 }
 
 
@@ -445,9 +592,9 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect(SENSORNAME, mqtt_username, mqtt_password)) {
+    if (client.connect(SENSORNAME, &mqtt_username[0], &mqtt_password[0])) {
       Serial.println("connected");
-      client.subscribe(light_set_topic);
+      client.subscribe(&topic_set[0]);
       setColor(0, 0, 0);
       sendState();
     } else {
